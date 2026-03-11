@@ -446,7 +446,7 @@
         <label style="font-size:13px;color:var(--muted);display:block;margin-bottom:6px;">Price surge alert threshold (%)</label>
         <input type="number" id="surge-threshold" value="3" min="0.5" max="20" step="0.5" style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:8px 12px;color:var(--text);font-size:14px;width:120px;margin-bottom:14px;" />
         <div class="section-title" style="margin-top:10px;">Live Updates</div>
-        <label style="font-size:13px;color:var(--muted);display:block;margin-bottom:6px;">Prices refresh automatically every 30 seconds during market hours. Full data (history, sparklines) reloads on manual Refresh.</label>
+        <label style="font-size:13px;color:var(--muted);display:block;margin-bottom:6px;">Prices refresh automatically every 5 seconds during market hours. Full data (history, sparklines) reloads on manual Refresh.</label>
         <div class="section-title" style="margin-top:10px;">Portfolio</div>
         <label style="font-size:13px;color:var(--muted);display:block;margin-bottom:6px;">Edit tickers (one per line, format: TICKER:EXCHANGE)</label>
         <textarea id="ticker-editor" style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:10px 12px;color:var(--text);font-size:13px;width:100%;height:220px;resize:vertical;font-family:monospace;"></textarea>
@@ -868,7 +868,7 @@ async function liveUpdate() {
   document.getElementById('last-updated').textContent = 'Updated ' + new Date().toLocaleTimeString();
 
   // Reset countdown
-  secondsToNext = 30;
+  secondsToNext = 5;
 }
 
 function updateRowInPlace(ticker, prevPrice) {
@@ -924,21 +924,21 @@ function startLiveUpdates() {
   if (liveUpdateTimer) clearInterval(liveUpdateTimer);
   if (countdownTimer) clearInterval(countdownTimer);
 
-  secondsToNext = 30;
-  liveUpdateTimer = setInterval(liveUpdate, 30000);
+  secondsToNext = 5;
+  liveUpdateTimer = setInterval(liveUpdate, 5000);
 
   // Countdown display
   countdownTimer = setInterval(() => {
     secondsToNext--;
     const el = document.getElementById('next-update');
     if (el) el.textContent = `next in ${secondsToNext}s`;
-    if (secondsToNext <= 0) secondsToNext = 30;
+    if (secondsToNext <= 0) secondsToNext = 5;
   }, 1000);
 
   // Pulse dot animation
   const dot = document.getElementById('live-dot');
   dot.style.background = 'var(--green)';
-  dot.title = 'Live — updates every 30s';
+  dot.title = 'Live — updates every 5s';
 }
 
 // ─── RENDER TABLE ─────────────────────────────────────────────────────────────

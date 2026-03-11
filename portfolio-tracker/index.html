@@ -331,7 +331,11 @@
     </div>
   </div>
   <div class="header-right">
-    <span id="last-updated">Not yet loaded</span>
+    <div style="display:flex;align-items:center;gap:8px;">
+      <span id="live-dot" style="width:8px;height:8px;border-radius:50%;background:var(--muted);display:inline-block;transition:background 0.3s;"></span>
+      <span id="last-updated" style="font-size:12px;color:var(--muted);">Not yet loaded</span>
+      <span id="next-update" style="font-size:11px;color:var(--muted);min-width:60px;"></span>
+    </div>
     <button id="notify-btn" onclick="requestNotifications()">🔔 Enable Alerts</button>
     <button id="refresh-btn" onclick="loadAll()">
       <span id="refresh-icon">↻</span> Refresh
@@ -441,15 +445,8 @@
         <input type="number" id="drop-threshold" value="2" min="0.5" max="20" step="0.5" style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:8px 12px;color:var(--text);font-size:14px;width:120px;margin-bottom:14px;" />
         <label style="font-size:13px;color:var(--muted);display:block;margin-bottom:6px;">Price surge alert threshold (%)</label>
         <input type="number" id="surge-threshold" value="3" min="0.5" max="20" step="0.5" style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:8px 12px;color:var(--text);font-size:14px;width:120px;margin-bottom:14px;" />
-        <div class="section-title" style="margin-top:10px;">Auto-Refresh</div>
-        <label style="font-size:13px;color:var(--muted);display:block;margin-bottom:6px;">Refresh interval (minutes)</label>
-        <select id="refresh-interval" onchange="setRefreshInterval()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:8px 12px;border-radius:6px;font-size:14px;margin-bottom:14px;">
-          <option value="0">Manual only</option>
-          <option value="5">Every 5 minutes</option>
-          <option value="15" selected>Every 15 minutes</option>
-          <option value="30">Every 30 minutes</option>
-          <option value="60">Every hour</option>
-        </select>
+        <div class="section-title" style="margin-top:10px;">Live Updates</div>
+        <label style="font-size:13px;color:var(--muted);display:block;margin-bottom:6px;">Prices refresh automatically every 30 seconds during market hours. Full data (history, sparklines) reloads on manual Refresh.</label>
         <div class="section-title" style="margin-top:10px;">Portfolio</div>
         <label style="font-size:13px;color:var(--muted);display:block;margin-bottom:6px;">Edit tickers (one per line, format: TICKER:EXCHANGE)</label>
         <textarea id="ticker-editor" style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:10px 12px;color:var(--text);font-size:13px;width:100%;height:220px;resize:vertical;font-family:monospace;"></textarea>
@@ -583,37 +580,45 @@ async function fetchWithProxy(url) {
 
 async function fetchQuote(ticker, exchange) {
   const sym = toYahooSymbol(ticker, exchange);
-  // Use 5d range so we always have yesterday's close in the close array
-  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?interval=1d&range=5d`;
-  // Fetch 1mo separately for sparkline history
-  const urlHistory = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?interval=1d&range=1mo`;
+  // Single fetch: 3mo gives enough history for sparklines AND yesterday's close
+  // Never use chartPreviousClose from meta — it reflects start-of-range, not yesterday
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?interval=1d&range=3mo`;
   try {
-    const [data, dataHistory] = await Promise.all([
-      fetchWithProxy(url),
-      fetchWithProxy(urlHistory),
-    ]);
+    const data = await fetchWithProxy(url);
     const result = data?.chart?.result?.[0];
     if (!result) return null;
     const meta = result.meta;
 
-    // Get yesterday's actual close from the close array (second-to-last entry)
-    const closes5d = result.indicators?.quote?.[0]?.close || [];
-    const valid5d = closes5d.filter(v => v != null);
-    // prevClose = the last fully-closed day before today
-    // If market is open today, last entry is today's partial — use second-to-last
-    // If market is closed, last entry is yesterday — use it
-    const prevClose = valid5d.length >= 2 ? valid5d[valid5d.length - 2] : (meta.chartPreviousClose || meta.previousClose);
+    const closes = result.indicators?.quote?.[0]?.close || [];
+    const timestamps = result.timestamp || [];
 
-    // History for sparkline from 1mo fetch
-    const historyCloses = dataHistory?.chart?.result?.[0]?.indicators?.quote?.[0]?.close || [];
-    const validHistory = historyCloses.filter(v => v != null);
+    // Use the exchange's UTC offset (gmtoffset) from meta to determine "today" correctly
+    // regardless of the user's local timezone. This avoids misidentifying today's
+    // intraday entry as yesterday on TSX stocks when the browser is in a different zone.
+    const gmtOffset = meta.gmtoffset ?? -14400; // default to EDT (-4h) if missing
+    const nowInExchangeTz = Math.floor(Date.now() / 1000) + gmtOffset;
+    const todayMidnightExchange = nowInExchangeTz - (nowInExchangeTz % 86400);
+
+    const completedDays = [];
+    for (let i = 0; i < timestamps.length; i++) {
+      // Convert timestamp to exchange-local day boundary
+      const tsInExchangeTz = timestamps[i] + gmtOffset;
+      const dayMidnight = tsInExchangeTz - (tsInExchangeTz % 86400);
+      if (dayMidnight < todayMidnightExchange && closes[i] != null) {
+        completedDays.push(closes[i]);
+      }
+    }
+
+    // prevClose = most recent completed trading day's close
+    const prevClose = completedDays[completedDays.length - 1] ?? null;
+    const price = meta.regularMarketPrice;
 
     return {
       ticker,
       exchange,
       symbol: sym,
       name: meta.shortName || meta.longName || ticker,
-      price: meta.regularMarketPrice,
+      price,
       prevClose,
       open: meta.regularMarketOpen,
       high: meta.regularMarketDayHigh,
@@ -625,7 +630,7 @@ async function fetchQuote(ticker, exchange) {
       week52Low: meta.fiftyTwoWeekLow,
       avgVolume: meta.averageDailyVolume10Day,
       currency: meta.currency,
-      history: validHistory.slice(-30),
+      history: completedDays.slice(-30),
     };
   } catch(e) {
     console.warn(`Failed to fetch ${sym}:`, e.message);
@@ -799,6 +804,141 @@ async function loadAll() {
   document.getElementById('last-updated').textContent = 'Updated ' + now.toLocaleTimeString();
   btn.disabled = false;
   btn.innerHTML = '↻ Refresh';
+
+  // Start live 30-second price updates
+  startLiveUpdates();
+}
+
+// ─── LIVE PRICE UPDATE (lightweight — no history refetch) ────────────────────
+let liveUpdateTimer = null;
+let countdownTimer = null;
+let secondsToNext = 30;
+
+async function fetchLivePrice(ticker, exchange) {
+  const sym = toYahooSymbol(ticker, exchange);
+  // Use 1d range for the fastest possible response — only need today's intraday data
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?interval=1d&range=1d`;
+  try {
+    const data = await fetchWithProxy(url);
+    const result = data?.chart?.result?.[0];
+    if (!result) return null;
+    const meta = result.meta;
+    return {
+      price: meta.regularMarketPrice,
+      high: meta.regularMarketDayHigh,
+      low: meta.regularMarketDayLow,
+      volume: meta.regularMarketVolume,
+    };
+  } catch(e) {
+    return null;
+  }
+}
+
+async function liveUpdate() {
+  const tickers = getTickers();
+  const seen = new Set();
+  const unique = tickers.filter(t => { if (seen.has(t.ticker)) return false; seen.add(t.ticker); return true; });
+
+  // Flash dot green to show update is running
+  const dot = document.getElementById('live-dot');
+  dot.style.background = 'var(--yellow)';
+
+  // Fetch price updates in parallel batches of 6
+  const batchSize = 6;
+  for (let i = 0; i < unique.length; i += batchSize) {
+    const batch = unique.slice(i, i + batchSize);
+    await Promise.all(batch.map(async (t) => {
+      const live = await fetchLivePrice(t.ticker, t.exchange);
+      if (!live || !portfolioData[t.ticker]) return;
+
+      const prev = portfolioData[t.ticker].price;
+      portfolioData[t.ticker].price = live.price;
+      portfolioData[t.ticker].high = live.high;
+      portfolioData[t.ticker].low = live.low;
+      portfolioData[t.ticker].volume = live.volume;
+
+      // Update only the changed cells in-place (no full re-render)
+      updateRowInPlace(t.ticker, prev);
+      checkAlerts(portfolioData[t.ticker]);
+    }));
+  }
+
+  updateSummary();
+  dot.style.background = 'var(--green)';
+  document.getElementById('last-updated').textContent = 'Updated ' + new Date().toLocaleTimeString();
+
+  // Reset countdown
+  secondsToNext = 30;
+}
+
+function updateRowInPlace(ticker, prevPrice) {
+  const d = portfolioData[ticker];
+  if (!d) return;
+
+  const ch = fmtChange(d.price, d.prevClose);
+
+  // Price cell
+  const priceCell = document.getElementById(`price-${ticker}`);
+  if (priceCell) {
+    const oldPrice = parseFloat(priceCell.dataset.price);
+    priceCell.textContent = fmtPrice(d.price, d.currency);
+    priceCell.dataset.price = d.price;
+    // Flash animation: green if went up, red if went down since last tick
+    if (d.price > oldPrice) flashCell(priceCell, 'rgba(63,185,80,0.3)');
+    else if (d.price < oldPrice) flashCell(priceCell, 'rgba(248,81,73,0.3)');
+  }
+
+  // Change cells
+  const changeCell = document.getElementById(`change-${ticker}`);
+  if (changeCell) {
+    changeCell.innerHTML = `<span class="change-badge ${ch.cls}">${ch.val}</span>`;
+  }
+  const pctCell = document.getElementById(`pct-${ticker}`);
+  if (pctCell) {
+    pctCell.innerHTML = `<span class="change-badge ${ch.cls}">${ch.pct}</span>`;
+  }
+
+  // Volume cell
+  const volCell = document.getElementById(`vol-${ticker}`);
+  if (volCell) volCell.textContent = fmtVol(d.volume);
+
+  // Sparkline — append new price to history tail
+  const canvas = document.getElementById(`spark-${ticker}`);
+  if (canvas && d.history?.length) {
+    const color = ch.cls === 'up' ? '#3fb950' : ch.cls === 'down' ? '#f85149' : '#8b949e';
+    const sparkData = [...d.history, d.price];
+    drawSparkline(canvas, sparkData, color);
+  }
+}
+
+function flashCell(el, color) {
+  el.style.transition = 'background 0s';
+  el.style.background = color;
+  setTimeout(() => {
+    el.style.transition = 'background 1.5s ease';
+    el.style.background = 'transparent';
+  }, 50);
+}
+
+function startLiveUpdates() {
+  if (liveUpdateTimer) clearInterval(liveUpdateTimer);
+  if (countdownTimer) clearInterval(countdownTimer);
+
+  secondsToNext = 30;
+  liveUpdateTimer = setInterval(liveUpdate, 30000);
+
+  // Countdown display
+  countdownTimer = setInterval(() => {
+    secondsToNext--;
+    const el = document.getElementById('next-update');
+    if (el) el.textContent = `next in ${secondsToNext}s`;
+    if (secondsToNext <= 0) secondsToNext = 30;
+  }, 1000);
+
+  // Pulse dot animation
+  const dot = document.getElementById('live-dot');
+  dot.style.background = 'var(--green)';
+  dot.title = 'Live — updates every 30s';
 }
 
 // ─── RENDER TABLE ─────────────────────────────────────────────────────────────
@@ -860,11 +1000,11 @@ function renderTable() {
         <div><div style="font-size:13px;font-weight:500;">${(d.name||r.ticker).substring(0,22)}</div>
         <span class="exchange-badge">${r.exchange}</span></div>
       </div></td>
-      <td style="font-weight:600;">${fmtPrice(d.price, d.currency)}</td>
-      <td><span class="change-badge ${ch.cls}">${ch.val}</span></td>
-      <td><span class="change-badge ${ch.cls}">${ch.pct}</span></td>
+      <td id="price-${r.ticker}" data-price="${d.price}" style="font-weight:600;">${fmtPrice(d.price, d.currency)}</td>
+      <td id="change-${r.ticker}"><span class="change-badge ${ch.cls}">${ch.val}</span></td>
+      <td id="pct-${r.ticker}"><span class="change-badge ${ch.cls}">${ch.pct}</span></td>
       <td>${rangeHtml}</td>
-      <td>${fmtVol(d.volume)}</td>
+      <td id="vol-${r.ticker}">${fmtVol(d.volume)}</td>
       <td>${fmtCap(d.mktCap)}</td>
       <td><span class="signal-badge ${signalCls}">${signal}</span></td>
       <td><canvas id="${canvasId}" class="sparkline" width="80" height="32"></canvas></td>
@@ -1196,12 +1336,8 @@ function switchTab(name) {
   if (name === 'alerts') { renderActiveAlerts(); renderTriggeredAlerts(); }
 }
 
-// ─── AUTO REFRESH ─────────────────────────────────────────────────────────────
-function setRefreshInterval() {
-  if (refreshTimer) clearInterval(refreshTimer);
-  const mins = parseInt(document.getElementById('refresh-interval').value);
-  if (mins > 0) refreshTimer = setInterval(loadAll, mins * 60 * 1000);
-}
+// ─── AUTO REFRESH (legacy — replaced by startLiveUpdates) ────────────────────
+function setRefreshInterval() { /* now handled by startLiveUpdates */ }
 
 // ─── SETTINGS ────────────────────────────────────────────────────────────────
 function initSettings() {

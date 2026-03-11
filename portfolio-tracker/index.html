@@ -440,7 +440,17 @@
   <div id="tab-settings" class="tab-content">
     <div style="max-width:500px;">
       <div class="table-container" style="padding:20px;">
-        <div class="section-title">Alert Thresholds</div>
+        <div class="section-title">Finnhub API Key</div>
+        <label style="font-size:13px;color:var(--muted);display:block;margin-bottom:6px;">
+          Free key at <a href="https://finnhub.io/register" target="_blank" style="color:var(--accent);">finnhub.io/register</a> — no credit card needed.
+        </label>
+        <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px;">
+          <input type="password" id="finnhub-key-input" placeholder="Paste your Finnhub API key here"
+            style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:8px 12px;color:var(--text);font-size:14px;flex:1;" />
+          <button class="btn-primary" onclick="saveFinnhubKey()">Save</button>
+        </div>
+        <div id="finnhub-key-status" style="font-size:12px;color:var(--muted);margin-bottom:14px;"></div>
+        <div class="section-title" style="margin-top:10px;">Alert Thresholds</div>
         <label style="font-size:13px;color:var(--muted);display:block;margin-bottom:6px;">Price drop alert threshold (%)</label>
         <input type="number" id="drop-threshold" value="2" min="0.5" max="20" step="0.5" style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:8px 12px;color:var(--text);font-size:14px;width:120px;margin-bottom:14px;" />
         <label style="font-size:13px;color:var(--muted);display:block;margin-bottom:6px;">Price surge alert threshold (%)</label>
@@ -539,96 +549,76 @@ function getTickers() {
   return DEFAULT_TICKERS;
 }
 
-// ─── YAHOO FINANCE SYMBOL MAPPING ─────────────────────────────────────────────
-function toYahooSymbol(ticker, exchange) {
-  if (exchange === 'TSX') return ticker + '.TO';
-  if (exchange === 'TSX-V') return ticker + '.V';
-  if (exchange === 'NASDAQ' || exchange === 'NYSE' || exchange === 'AMEX') return ticker;
+// ─── FINNHUB SYMBOL MAPPING ───────────────────────────────────────────────────
+function toFinnhubSymbol(ticker, exchange) {
+  if (exchange === 'TSX') return 'TSX:' + ticker;
+  if (exchange === 'TSX-V') return 'TSXV:' + ticker;
+  // US exchanges: NASDAQ, NYSE, AMEX — use ticker as-is
   return ticker;
 }
 
-// ─── DATA FETCHING ────────────────────────────────────────────────────────────
-// Uses Yahoo Finance v8 chart API via CORS proxy (tries corsproxy.io first, falls back to allorigins)
-// Try multiple CORS proxies in sequence until one works
-const CORS_PROXIES = [
-  url => `https://corsproxy.io/?${encodeURIComponent(url)}`,
-  url => `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`,
-  url => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
-];
+function getFinnhubKey() {
+  return localStorage.getItem('finnhub_api_key') || '';
+}
 
-async function fetchWithProxy(url) {
-  for (const makeProxy of CORS_PROXIES) {
-    try {
-      const proxyUrl = makeProxy(url);
-      const res = await fetch(proxyUrl, { signal: AbortSignal.timeout(10000) });
-      if (!res.ok) continue;
-      const text = await res.text();
-      // allorigins wraps in {contents: "..."}
-      try {
-        const wrapper = JSON.parse(text);
-        if (wrapper.contents) return JSON.parse(wrapper.contents);
-        return wrapper; // corsproxy returns raw JSON
-      } catch {
-        return JSON.parse(text);
-      }
-    } catch(e) {
-      continue; // try next proxy
-    }
-  }
-  throw new Error('All proxies failed');
+// ─── DATA FETCHING ────────────────────────────────────────────────────────────
+// Uses Finnhub API — no CORS proxy needed, free tier: 60 calls/min
+// Docs: https://finnhub.io/docs/api
+
+async function finnhubFetch(path) {
+  const key = getFinnhubKey();
+  if (!key) throw new Error('No Finnhub API key set. Please add your key in Settings.');
+  const url = `https://finnhub.io/api/v1${path}&token=${key}`;
+  const res = await fetch(url, { signal: AbortSignal.timeout(10000) });
+  if (!res.ok) throw new Error(`Finnhub ${res.status}: ${res.statusText}`);
+  return res.json();
 }
 
 async function fetchQuote(ticker, exchange) {
-  const sym = toYahooSymbol(ticker, exchange);
-  // Single fetch: 3mo gives enough history for sparklines AND yesterday's close
-  // range=1d gives chartPreviousClose = yesterday's actual close (the same value Yahoo Finance uses)
-  // range=3mo gives 30 days of history for the sparkline
-  const url1d  = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?interval=1d&range=1d&includePrePost=false`;
-  const url3mo = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?interval=1d&range=3mo`;
+  const sym = toFinnhubSymbol(ticker, exchange);
   try {
-    const [data1d, data3mo] = await Promise.all([
-      fetchWithProxy(url1d),
-      fetchWithProxy(url3mo),
+    // Parallel: quote (price/prevClose/OHLCV) + profile (name/mktcap) + candles (sparkline history)
+    const today = new Date();
+    const from90 = Math.floor((Date.now() - 90 * 86400 * 1000) / 1000);
+    const to = Math.floor(Date.now() / 1000);
+
+    const [quote, profile, candles] = await Promise.all([
+      finnhubFetch(`/quote?symbol=${encodeURIComponent(sym)}`),
+      finnhubFetch(`/stock/profile2?symbol=${encodeURIComponent(sym)}`).catch(() => ({})),
+      finnhubFetch(`/stock/candle?symbol=${encodeURIComponent(sym)}&resolution=D&from=${from90}&to=${to}`).catch(() => ({ s: 'no_data' })),
     ]);
 
-    const result = data1d?.chart?.result?.[0];
-    if (!result) return null;
-    const meta = result.meta;
+    if (!quote || quote.c == null || quote.c === 0) return null;
 
-    // chartPreviousClose on a 1d range = yesterday's official close — matches Yahoo Finance exactly
-    const prevClose = meta.chartPreviousClose;
-    const price = meta.regularMarketPrice;
-
-    // Sparkline history from 3mo — completed days only
-    const closes3mo = data3mo?.chart?.result?.[0]?.indicators?.quote?.[0]?.close || [];
-    const timestamps3mo = data3mo?.chart?.result?.[0]?.timestamp || [];
-    const gmtOffset = meta.gmtoffset ?? -14400;
-    const nowInExTz = Math.floor(Date.now() / 1000) + gmtOffset;
-    const todayMid = nowInExTz - (nowInExTz % 86400);
+    // Sparkline: daily closes excluding today
     const history = [];
-    for (let i = 0; i < timestamps3mo.length; i++) {
-      const tsEx = timestamps3mo[i] + gmtOffset;
-      const dayMid = tsEx - (tsEx % 86400);
-      if (dayMid < todayMid && closes3mo[i] != null) history.push(closes3mo[i]);
+    if (candles.s === 'ok' && Array.isArray(candles.c)) {
+      const todayDateStr = today.toISOString().slice(0, 10);
+      for (let i = 0; i < candles.t.length; i++) {
+        const candleDate = new Date(candles.t[i] * 1000).toISOString().slice(0, 10);
+        if (candleDate < todayDateStr && candles.c[i] != null) {
+          history.push(candles.c[i]);
+        }
+      }
     }
 
     return {
       ticker,
       exchange,
       symbol: sym,
-      name: meta.shortName || meta.longName || ticker,
-      price,
-      prevClose,
-      open: meta.regularMarketOpen,
-      high: meta.regularMarketDayHigh,
-      low: meta.regularMarketDayLow,
-      volume: meta.regularMarketVolume,
-      mktCap: meta.marketCap,
-      pe: meta.trailingPE,
-      week52High: meta.fiftyTwoWeekHigh,
-      week52Low: meta.fiftyTwoWeekLow,
-      avgVolume: meta.averageDailyVolume10Day,
-      currency: meta.currency,
+      name: profile.name || ticker,
+      price: quote.c,
+      prevClose: quote.pc,
+      open: quote.o,
+      high: quote.h,
+      low: quote.l,
+      volume: null,           // Finnhub quote doesn't include volume; available via /stock/metric
+      mktCap: profile.marketCapitalization ? profile.marketCapitalization * 1e6 : null,
+      pe: null,               // available via /stock/metric if needed
+      week52High: quote['52WeekHigh'] ?? null,
+      week52Low: quote['52WeekLow'] ?? null,
+      avgVolume: null,
+      currency: profile.currency || (exchange === 'TSX' || exchange === 'TSX-V' ? 'CAD' : 'USD'),
       history: history.slice(-30),
     };
   } catch(e) {
@@ -638,14 +628,15 @@ async function fetchQuote(ticker, exchange) {
 }
 
 async function fetchNews(symbol) {
-  const url = `https://query2.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(symbol)}&newsCount=5&quotesCount=0`;
   try {
-    const data = await fetchWithProxy(url);
-    return (data?.news || []).slice(0, 5).map(n => ({
-      title: n.title,
-      link: n.link,
-      publisher: n.publisher,
-      time: n.providerPublishTime,
+    const to = new Date().toISOString().slice(0, 10);
+    const from = new Date(Date.now() - 7 * 86400 * 1000).toISOString().slice(0, 10);
+    const data = await finnhubFetch(`/company-news?symbol=${encodeURIComponent(symbol)}&from=${from}&to=${to}`);
+    return (Array.isArray(data) ? data : []).slice(0, 5).map(n => ({
+      title: n.headline,
+      link: n.url,
+      publisher: n.source,
+      time: n.datetime,
     }));
   } catch(e) {
     return [];
@@ -756,6 +747,21 @@ function sentimentColor(title) {
 
 // ─── MAIN LOAD ────────────────────────────────────────────────────────────────
 async function loadAll() {
+  // Guard: require Finnhub API key
+  if (!getFinnhubKey()) {
+    document.getElementById('holdings-body').innerHTML =
+      `<tr><td colspan="9" style="text-align:center;padding:40px;color:var(--yellow);">
+        ⚠ No Finnhub API key found.<br><br>
+        Go to <strong>Settings</strong> tab → paste your free key from
+        <a href="https://finnhub.io/register" target="_blank" style="color:var(--accent);">finnhub.io/register</a>
+        → click <strong>Save</strong>.
+      </td></tr>`;
+    const btn = document.getElementById('refresh-btn');
+    btn.disabled = false;
+    btn.innerHTML = '↻ Refresh';
+    return;
+  }
+
   const btn = document.getElementById('refresh-btn');
   btn.disabled = true;
   btn.innerHTML = '<span style="animation:spin 1s linear infinite;display:inline-block">↻</span> Loading…';
@@ -814,20 +820,16 @@ let countdownTimer = null;
 let secondsToNext = 30;
 
 async function fetchLivePrice(ticker, exchange) {
-  const sym = toYahooSymbol(ticker, exchange);
-  // Use 1d range for the fastest possible response — only need today's intraday data
-  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?interval=1d&range=1d`;
+  const sym = toFinnhubSymbol(ticker, exchange);
   try {
-    const data = await fetchWithProxy(url);
-    const result = data?.chart?.result?.[0];
-    if (!result) return null;
-    const meta = result.meta;
+    const quote = await finnhubFetch(`/quote?symbol=${encodeURIComponent(sym)}`);
+    if (!quote || quote.c == null || quote.c === 0) return null;
     return {
-      price: meta.regularMarketPrice,
-      prevClose: meta.chartPreviousClose,
-      high: meta.regularMarketDayHigh,
-      low: meta.regularMarketDayLow,
-      volume: meta.regularMarketVolume,
+      price: quote.c,
+      prevClose: quote.pc,
+      high: quote.h,
+      low: quote.l,
+      volume: null,
     };
   } catch(e) {
     return null;
@@ -1228,7 +1230,7 @@ function triggerAlert(ticker, message, icon, change) {
 
 function sendBrowserNotification(title, body) {
   if (Notification.permission === 'granted') {
-    new Notification(title, { body, icon: 'https://finance.yahoo.com/favicon.ico' });
+    new Notification(title, { body, icon: 'https://finnhub.io/favicon.ico' });
   }
 }
 
@@ -1344,6 +1346,31 @@ function setRefreshInterval() { /* now handled by startLiveUpdates */ }
 function initSettings() {
   const tickers = getTickers();
   document.getElementById('ticker-editor').value = tickers.map(t => `${t.ticker}:${t.exchange}`).join('\n');
+  // Populate Finnhub key field
+  const key = getFinnhubKey();
+  const input = document.getElementById('finnhub-key-input');
+  const status = document.getElementById('finnhub-key-status');
+  if (key) {
+    input.value = key;
+    status.textContent = '✓ API key saved';
+    status.style.color = 'var(--green)';
+  } else {
+    status.textContent = '⚠ No API key — data will not load until you save a key.';
+    status.style.color = 'var(--yellow)';
+  }
+}
+function saveFinnhubKey() {
+  const key = document.getElementById('finnhub-key-input').value.trim();
+  const status = document.getElementById('finnhub-key-status');
+  if (!key) {
+    status.textContent = '⚠ Please paste a valid API key.';
+    status.style.color = 'var(--yellow)';
+    return;
+  }
+  localStorage.setItem('finnhub_api_key', key);
+  status.textContent = '✓ Key saved! Reloading data…';
+  status.style.color = 'var(--green)';
+  setTimeout(() => { portfolioData = {}; loadAll(); }, 800);
 }
 function saveTickers() {
   const lines = document.getElementById('ticker-editor').value.trim().split('\n');

@@ -64,8 +64,11 @@ Your browser will ask for permission. Once granted:
 
 ## Data Source
 
-All data comes from Yahoo Finance's unofficial public API — no API key required.
-TSX tickers use the `.TO` suffix (e.g. `XEQT.TO`), TSX-V uses `.V`.
+All data comes from the **Finnhub API** (https://finnhub.io).
+A free API key is required — register at https://finnhub.io/register (no credit card).
+Once you have a key, open the app → **Settings** tab → paste the key → **Save**.
+
+TSX tickers use the `TSX:TICKER` format, TSX-V uses `TSXV:TICKER`, US tickers are used as-is.
 
 ## Updating Your Tickers
 

@@ -581,37 +581,36 @@ async function fetchWithProxy(url) {
 async function fetchQuote(ticker, exchange) {
   const sym = toYahooSymbol(ticker, exchange);
   // Single fetch: 3mo gives enough history for sparklines AND yesterday's close
-  // Never use chartPreviousClose from meta — it reflects start-of-range, not yesterday
-  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?interval=1d&range=3mo`;
+  // range=1d gives chartPreviousClose = yesterday's actual close (the same value Yahoo Finance uses)
+  // range=3mo gives 30 days of history for the sparkline
+  const url1d  = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?interval=1d&range=1d&includePrePost=false`;
+  const url3mo = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?interval=1d&range=3mo`;
   try {
-    const data = await fetchWithProxy(url);
-    const result = data?.chart?.result?.[0];
+    const [data1d, data3mo] = await Promise.all([
+      fetchWithProxy(url1d),
+      fetchWithProxy(url3mo),
+    ]);
+
+    const result = data1d?.chart?.result?.[0];
     if (!result) return null;
     const meta = result.meta;
 
-    const closes = result.indicators?.quote?.[0]?.close || [];
-    const timestamps = result.timestamp || [];
-
-    // Use the exchange's UTC offset (gmtoffset) from meta to determine "today" correctly
-    // regardless of the user's local timezone. This avoids misidentifying today's
-    // intraday entry as yesterday on TSX stocks when the browser is in a different zone.
-    const gmtOffset = meta.gmtoffset ?? -14400; // default to EDT (-4h) if missing
-    const nowInExchangeTz = Math.floor(Date.now() / 1000) + gmtOffset;
-    const todayMidnightExchange = nowInExchangeTz - (nowInExchangeTz % 86400);
-
-    const completedDays = [];
-    for (let i = 0; i < timestamps.length; i++) {
-      // Convert timestamp to exchange-local day boundary
-      const tsInExchangeTz = timestamps[i] + gmtOffset;
-      const dayMidnight = tsInExchangeTz - (tsInExchangeTz % 86400);
-      if (dayMidnight < todayMidnightExchange && closes[i] != null) {
-        completedDays.push(closes[i]);
-      }
-    }
-
-    // prevClose = most recent completed trading day's close
-    const prevClose = completedDays[completedDays.length - 1] ?? null;
+    // chartPreviousClose on a 1d range = yesterday's official close — matches Yahoo Finance exactly
+    const prevClose = meta.chartPreviousClose;
     const price = meta.regularMarketPrice;
+
+    // Sparkline history from 3mo — completed days only
+    const closes3mo = data3mo?.chart?.result?.[0]?.indicators?.quote?.[0]?.close || [];
+    const timestamps3mo = data3mo?.chart?.result?.[0]?.timestamp || [];
+    const gmtOffset = meta.gmtoffset ?? -14400;
+    const nowInExTz = Math.floor(Date.now() / 1000) + gmtOffset;
+    const todayMid = nowInExTz - (nowInExTz % 86400);
+    const history = [];
+    for (let i = 0; i < timestamps3mo.length; i++) {
+      const tsEx = timestamps3mo[i] + gmtOffset;
+      const dayMid = tsEx - (tsEx % 86400);
+      if (dayMid < todayMid && closes3mo[i] != null) history.push(closes3mo[i]);
+    }
 
     return {
       ticker,
@@ -630,7 +629,7 @@ async function fetchQuote(ticker, exchange) {
       week52Low: meta.fiftyTwoWeekLow,
       avgVolume: meta.averageDailyVolume10Day,
       currency: meta.currency,
-      history: completedDays.slice(-30),
+      history: history.slice(-30),
     };
   } catch(e) {
     console.warn(`Failed to fetch ${sym}:`, e.message);
@@ -825,6 +824,7 @@ async function fetchLivePrice(ticker, exchange) {
     const meta = result.meta;
     return {
       price: meta.regularMarketPrice,
+      prevClose: meta.chartPreviousClose,
       high: meta.regularMarketDayHigh,
       low: meta.regularMarketDayLow,
       volume: meta.regularMarketVolume,
@@ -853,6 +853,7 @@ async function liveUpdate() {
 
       const prev = portfolioData[t.ticker].price;
       portfolioData[t.ticker].price = live.price;
+      portfolioData[t.ticker].prevClose = live.prevClose ?? portfolioData[t.ticker].prevClose;
       portfolioData[t.ticker].high = live.high;
       portfolioData[t.ticker].low = live.low;
       portfolioData[t.ticker].volume = live.volume;

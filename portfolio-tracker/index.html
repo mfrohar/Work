@@ -379,6 +379,9 @@
     </div>
   </div>
 
+  <!-- Fetch error banner -->
+  <div id="fetch-error-banner" style="display:none;background:rgba(248,81,73,0.15);border:1px solid var(--red);border-radius:8px;padding:10px 16px;margin-bottom:12px;font-size:13px;color:var(--red);line-height:1.6;"></div>
+
   <!-- Tabs -->
   <div class="tabs">
     <button class="tab active" onclick="switchTab('holdings')">Holdings</button>
@@ -550,38 +553,52 @@ function toYahooSymbol(ticker, exchange) {
 // ─── DATA FETCHING ────────────────────────────────────────────────────────────
 // Uses Yahoo Finance v8 chart API via CORS proxy (tries corsproxy.io first, then fallbacks)
 const CORS_PROXIES = [
-  url => `https://corsproxy.io/?${encodeURIComponent(url)}`,
+  url => `https://corsproxy.io/?url=${encodeURIComponent(url)}`,
   url => `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`,
+  url => `https://thingproxy.freeboard.io/fetch/${url}`,
   url => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
+  url => `https://corsproxy.io/?${encodeURIComponent(url)}`,
 ];
 
 async function fetchWithProxy(url) {
+  let lastErr = '';
   for (const makeProxy of CORS_PROXIES) {
     try {
       const proxyUrl = makeProxy(url);
-      const res = await fetch(proxyUrl, { signal: AbortSignal.timeout(10000) });
-      if (!res.ok) continue;
+      const res = await fetch(proxyUrl, {
+        signal: AbortSignal.timeout(12000),
+        headers: { 'Accept': 'application/json' },
+      });
+      if (!res.ok) { lastErr = `HTTP ${res.status}`; continue; }
       const text = await res.text();
+      if (!text || text.trim() === '') { lastErr = 'empty response'; continue; }
       try {
         const wrapper = JSON.parse(text);
-        if (wrapper.contents) return JSON.parse(wrapper.contents);
-        return wrapper;
-      } catch {
-        return JSON.parse(text);
+        // allorigins wraps in { contents: "..." }
+        if (wrapper.contents) {
+          const inner = JSON.parse(wrapper.contents);
+          if (inner?.chart?.result || inner?.news !== undefined) return inner;
+          lastErr = 'allorigins: inner parse empty'; continue;
+        }
+        if (wrapper?.chart?.result || wrapper?.news !== undefined) return wrapper;
+        lastErr = 'parsed but no chart/news key'; continue;
+      } catch(pe) {
+        lastErr = 'JSON parse: ' + pe.message; continue;
       }
     } catch(e) {
-      continue;
+      lastErr = e.message; continue;
     }
   }
-  throw new Error('All proxies failed');
+  throw new Error(`All proxies failed. Last error: ${lastErr}`);
 }
 
 async function fetchQuote(ticker, exchange) {
   const sym = toYahooSymbol(ticker, exchange);
+  // Try query2 first (sometimes more permissive), fall back to query1
   // range=1d: chartPreviousClose = yesterday's official close (matches Yahoo Finance exactly)
   // range=3mo: 30 days of daily closes for sparkline history
-  const url1d  = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?interval=1d&range=1d&includePrePost=false`;
-  const url3mo = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?interval=1d&range=3mo`;
+  const url1d  = `https://query2.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?interval=1d&range=1d&includePrePost=false&corsDomain=finance.yahoo.com`;
+  const url3mo = `https://query2.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?interval=1d&range=3mo&corsDomain=finance.yahoo.com`;
   try {
     const [data1d, data3mo] = await Promise.all([
       fetchWithProxy(url1d),
@@ -634,7 +651,7 @@ async function fetchQuote(ticker, exchange) {
 }
 
 async function fetchNews(symbol) {
-  const url = `https://query2.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(symbol)}&newsCount=5&quotesCount=0`;
+  const url = `https://query2.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(symbol)}&newsCount=5&quotesCount=0&corsDomain=finance.yahoo.com`;
   try {
     const data = await fetchWithProxy(url);
     return (data?.news || []).slice(0, 5).map(n => ({
@@ -778,16 +795,32 @@ async function loadAll() {
     </tr>`).join('');
 
   // Fetch all in parallel (batches of 5)
+  let fetchErrors = [];
   const batchSize = 5;
   for (let i = 0; i < tickers.length; i += batchSize) {
     const batch = tickers.slice(i, i + batchSize);
     await Promise.all(batch.map(async (t) => {
-      const data = await fetchQuote(t.ticker, t.exchange);
-      if (data) {
-        portfolioData[t.ticker] = data;
-        checkAlerts(data);
+      try {
+        const data = await fetchQuote(t.ticker, t.exchange);
+        if (data) {
+          portfolioData[t.ticker] = data;
+          checkAlerts(data);
+        } else {
+          fetchErrors.push(`${t.ticker}: returned null`);
+        }
+      } catch(e) {
+        fetchErrors.push(`${t.ticker}: ${e.message}`);
       }
     }));
+  }
+
+  // Show error banner if any fetches failed
+  const banner = document.getElementById('fetch-error-banner');
+  if (fetchErrors.length > 0 && banner) {
+    banner.style.display = 'block';
+    banner.innerHTML = `⚠ Data fetch errors (open browser console for details):<br><small>${fetchErrors.slice(0,3).join('<br>')}</small>`;
+  } else if (banner) {
+    banner.style.display = 'none';
   }
 
   renderTable();
@@ -811,7 +844,7 @@ let secondsToNext = 10;
 
 async function fetchLivePrice(ticker, exchange) {
   const sym = toYahooSymbol(ticker, exchange);
-  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?interval=1d&range=1d`;
+  const url = `https://query2.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?interval=1d&range=1d&corsDomain=finance.yahoo.com`;
   try {
     const data = await fetchWithProxy(url);
     const result = data?.chart?.result?.[0];
